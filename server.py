@@ -18,8 +18,6 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 PINECONE_API_KEY = os.getenv("PINECONE_API_KEY", "")
 PINECONE_INDEX_NAME = os.getenv("PINECONE_INDEX_NAME", "")
 RAG_NAMESPACE = os.getenv("RAG_NAMESPACE", "sagewire-rag-v1")
-
-EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "text-embedding-3-small")
 CHAT_MODEL = os.getenv("CHAT_MODEL", "gpt-4o-mini")
 
 CHUNK_SIZE = int(os.getenv("CHUNK_SIZE", "1200"))
@@ -29,7 +27,7 @@ app = Flask(__name__)
 
 openai_client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 pinecone_client = Pinecone(api_key=PINECONE_API_KEY) if PINECONE_API_KEY else None
-pinecone_index = pinecone_client.index(PINECONE_INDEX_NAME) if pinecone_client and PINECONE_INDEX_NAME else None
+pinecone_index = pinecone_client.Index(PINECONE_INDEX_NAME) if pinecone_client and PINECONE_INDEX_NAME else None
 
 
 def utc_now():
@@ -52,24 +50,12 @@ def chunk_text(text, chunk_size=CHUNK_SIZE, overlap=CHUNK_OVERLAP):
             chunks.append(chunk)
 
         start = end - overlap
-        if start < 0:
-            start = 0
+        if start <= 0 and end >= len(text):
+            break
         if start >= len(text):
             break
 
     return chunks
-
-
-def embed_text(text):
-    if not openai_client:
-        raise RuntimeError("OPENAI_API_KEY is not configured")
-
-    result = openai_client.embeddings.create(
-        model=EMBEDDING_MODEL,
-        input=text
-    )
-
-    return result.data[0].embedding
 
 
 def require_index():
@@ -82,6 +68,34 @@ def make_chunk_id(source_id, chunk_number, chunk_text_value):
     raw = f"{source_id}:{chunk_number}:{chunk_text_value}"
     digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:24]
     return f"{source_id}-{chunk_number}-{digest}"
+
+
+def normalize_search_results(results):
+    matches = []
+
+    # Pinecone search() response usually exposes result["hits"].
+    hits = []
+
+    if isinstance(results, dict):
+        hits = results.get("result", {}).get("hits", []) or results.get("hits", [])
+    else:
+        try:
+            hits = results.get("result", {}).get("hits", [])
+        except Exception:
+            hits = []
+
+    for hit in hits:
+        fields = hit.get("fields", {}) or {}
+        matches.append({
+            "id": hit.get("_id") or hit.get("id"),
+            "score": hit.get("_score") or hit.get("score"),
+            "source_id": fields.get("source_id"),
+            "title": fields.get("title"),
+            "chunk_number": fields.get("chunk_number"),
+            "text": fields.get("text")
+        })
+
+    return matches
 
 
 @app.get("/health")
@@ -101,7 +115,8 @@ def info():
         "description": "Shared retrieval-augmented generation service for SageWire applications.",
         "version": SERVICE_VERSION,
         "namespace": RAG_NAMESPACE,
-        "embedding_model": EMBEDDING_MODEL,
+        "pinecone_index": PINECONE_INDEX_NAME,
+        "pinecone_embedding": "llama-text-embed-v2 integrated embedding",
         "chat_model": CHAT_MODEL,
         "status": "online"
     })
@@ -139,38 +154,31 @@ def ingest():
         chunks = chunk_text(text)
 
         if not chunks:
-            return jsonify({
-                "ok": False,
-                "error": "No text provided"
-            }), 400
+            return jsonify({"ok": False, "error": "No text provided"}), 400
 
-        vectors = []
+        records = []
 
         for i, chunk in enumerate(chunks):
-            embedding = embed_text(chunk)
-            chunk_id = make_chunk_id(source_id, i, chunk)
-
-            metadata = {
+            record = {
+                "_id": make_chunk_id(source_id, i, chunk),
+                "text": chunk,
                 "source_id": source_id,
                 "title": title,
                 "chunk_number": i,
-                "text": chunk,
                 "created_at": utc_now()
             }
 
             for key, value in metadata_extra.items():
                 if isinstance(value, (str, int, float, bool)) or value is None:
-                    metadata[key] = value
+                    record[key] = value
 
-            vectors.append({
-                "id": chunk_id,
-                "values": embedding,
-                "metadata": metadata
-            })
+            records.append(record)
 
-        index.upsert(
-            vectors=vectors,
-            namespace=RAG_NAMESPACE
+        # Pinecone integrated embedding index:
+        # upsert_records converts the configured text field into vectors automatically.
+        index.upsert_records(
+            RAG_NAMESPACE,
+            records
         )
 
         return jsonify({
@@ -178,15 +186,12 @@ def ingest():
             "service": SERVICE_NAME,
             "source_id": source_id,
             "title": title,
-            "chunks_ingested": len(vectors),
+            "chunks_ingested": len(records),
             "namespace": RAG_NAMESPACE
         })
 
     except Exception as err:
-        return jsonify({
-            "ok": False,
-            "error": str(err)
-        }), 500
+        return jsonify({"ok": False, "error": str(err)}), 500
 
 
 @app.post("/search")
@@ -201,27 +206,16 @@ def search():
         if not query.strip():
             return jsonify({"ok": False, "error": "query is required"}), 400
 
-        query_embedding = embed_text(query)
-
-        results = index.query(
-            vector=query_embedding,
-            top_k=top_k,
+        results = index.search(
             namespace=RAG_NAMESPACE,
-            include_metadata=True
+            query={
+                "inputs": {"text": query},
+                "top_k": top_k
+            },
+            fields=["text", "source_id", "title", "chunk_number", "created_at"]
         )
 
-        matches = []
-
-        for match in results.get("matches", []):
-            metadata = match.get("metadata") or {}
-            matches.append({
-                "id": match.get("id"),
-                "score": match.get("score"),
-                "source_id": metadata.get("source_id"),
-                "title": metadata.get("title"),
-                "chunk_number": metadata.get("chunk_number"),
-                "text": metadata.get("text")
-            })
+        matches = normalize_search_results(results)
 
         return jsonify({
             "ok": True,
@@ -230,10 +224,7 @@ def search():
         })
 
     except Exception as err:
-        return jsonify({
-            "ok": False,
-            "error": str(err)
-        }), 500
+        return jsonify({"ok": False, "error": str(err)}), 500
 
 
 @app.post("/ask")
@@ -251,30 +242,29 @@ def ask():
         if not question.strip():
             return jsonify({"ok": False, "error": "question is required"}), 400
 
-        query_embedding = embed_text(question)
-
-        results = index.query(
-            vector=query_embedding,
-            top_k=top_k,
+        results = index.search(
             namespace=RAG_NAMESPACE,
-            include_metadata=True
+            query={
+                "inputs": {"text": question},
+                "top_k": top_k
+            },
+            fields=["text", "source_id", "title", "chunk_number", "created_at"]
         )
+
+        matches = normalize_search_results(results)
 
         contexts = []
         sources = []
 
-        for match in results.get("matches", []):
-            metadata = match.get("metadata") or {}
-            text = metadata.get("text") or ""
-
-            if text:
-                contexts.append(text)
+        for match in matches:
+            if match.get("text"):
+                contexts.append(match["text"])
                 sources.append({
                     "id": match.get("id"),
                     "score": match.get("score"),
-                    "source_id": metadata.get("source_id"),
-                    "title": metadata.get("title"),
-                    "chunk_number": metadata.get("chunk_number")
+                    "source_id": match.get("source_id"),
+                    "title": match.get("title"),
+                    "chunk_number": match.get("chunk_number")
                 })
 
         context_text = "\n\n---\n\n".join(contexts)
@@ -307,10 +297,7 @@ def ask():
         })
 
     except Exception as err:
-        return jsonify({
-            "ok": False,
-            "error": str(err)
-        }), 500
+        return jsonify({"ok": False, "error": str(err)}), 500
 
 
 if __name__ == "__main__":
