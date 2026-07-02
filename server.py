@@ -177,8 +177,8 @@ def ingest():
         # Pinecone integrated embedding index:
         # upsert_records converts the configured text field into vectors automatically.
         index.upsert_records(
-            RAG_NAMESPACE,
-            records
+        namespace=RAG_NAMESPACE,
+        records=records
         )
 
         return jsonify({
